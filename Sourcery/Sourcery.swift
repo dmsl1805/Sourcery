@@ -15,15 +15,11 @@ import xcproj
 import SourcerySwift
 #endif
 
-class Sourcery {
+final class Sourcery {
     public static let version: String = inUnitTests ? "Major.Minor.Patch" : Version.current.value
     public static let generationMarker: String = "// Generated using Sourcery"
     public static let generationHeader = "\(Sourcery.generationMarker) \(Sourcery.version) — https://github.com/krzysztofzablocki/Sourcery\n"
         + "// DO NOT EDIT\n\n"
-
-    enum Error: Swift.Error {
-        case containsMergeConflictMarkers
-    }
 
     fileprivate let verbose: Bool
     fileprivate let watcherEnabled: Bool
@@ -52,16 +48,11 @@ class Sourcery {
         self.prune = prune
     }
 
-    /// Processes source files and generates corresponding code.
-    ///
-    /// - Parameters:
-    ///   - files: Path of files to process, can be directory or specific file.
-    ///   - templatePath: Specific Template to use for code generation.
-    ///   - output: Path to output source code to.
-    ///   - forceParse: extensions of generated sourcery file that can be parsed
-    ///   - watcherEnabled: Whether daemon watcher should be enabled.
-    /// - Throws: Potential errors.
-    func processFiles(_ source: Source, usingTemplates templatesPaths: Paths, output: Output, forceParse: [String] = []) throws -> [FolderWatcher.Local]? {
+    public func scanFiles(_ source: Source,
+                          usingTemplates templatesPaths: Paths,
+                          output: Output,
+                          forceParse: [String] = [],
+                          result: @escaping (Parser.ParsingResult) throws -> Void) throws -> [FolderWatcher.Local]? {
         self.templatesPaths = templatesPaths
         self.outputPath = output
 
@@ -74,34 +65,8 @@ class Sourcery {
                                exclude: projects.flatMap({ $0.exclude }))
         }
 
-        let process: (Source) throws -> ParsingResult = { source in
-            var result: ParsingResult
-            switch source {
-            case let .sources(paths):
-                result = try self.parse(from: paths.include, exclude: paths.exclude, forceParse: forceParse, modules: nil)
-            case let .projects(projects):
-                var paths = [Path]()
-                var modules = [String]()
-                projects.forEach { project in
-                    project.targets.forEach { target in
-                        guard let projectTarget = project.file.target(named: target.name) else { return }
-
-                        let files: [Path] = project.file.sourceFilesPaths(target: projectTarget, sourceRoot: project.root)
-                        files.forEach { file in
-                            guard !project.exclude.contains(file) else { return }
-                            paths.append(file)
-                            modules.append(target.module)
-                        }
-                    }
-                }
-                result = try self.parse(from: paths, modules: modules)
-            }
-
-            try self.generate(source: source, templatePaths: templatesPaths, output: output, parsingResult: result)
-            return result
-        }
-
-        var result = try process(source)
+        var parsingResult = try parse(source: source, output: output, forceParse: forceParse)
+        try result(parsingResult)
 
         guard watcherEnabled else {
             return nil
@@ -116,7 +81,7 @@ class Sourcery {
                     .compactMap {
                         let path = Path($0.path)
                         return path.isSwiftSourceFile ? path : nil
-                    }
+                }
 
                 var pathThatForcedRegeneration: Path?
                 for path in eventPaths {
@@ -130,7 +95,8 @@ class Sourcery {
                 if let path = pathThatForcedRegeneration {
                     do {
                         Log.info("Source changed at \(path.string)")
-                        result = try process(source)
+                        parsingResult = try self.parse(source: source, output: output, forceParse: forceParse)
+                        try result(parsingResult)
                     } catch {
                         Log.error(error)
                     }
@@ -152,7 +118,7 @@ class Sourcery {
                         } else {
                             Log.info("Templates changed: ")
                         }
-                        try self.generate(source: source, templatePaths: Paths(include: [templatesPath]), output: output, parsingResult: result)
+                        try self.generate(source: source, templatePaths: Paths(include: [templatesPath]), output: output, parsingResult: parsingResult)
                     } catch {
                         Log.error(error)
                     }
@@ -161,6 +127,58 @@ class Sourcery {
         })
 
         return Array([sourceWatchers, templateWatchers].joined())
+    }
+
+    /// Processes source files and generates corresponding code.
+    ///
+    /// - Parameters:
+    ///   - files: Path of files to process, can be directory or specific file.
+    ///   - templatePath: Specific Template to use for code generation.
+    ///   - output: Path to output source code to.
+    ///   - forceParse: extensions of generated sourcery file that can be parsed
+    ///   - watcherEnabled: Whether daemon watcher should be enabled.
+    /// - Throws: Potential errors.
+    func processFiles(_ source: Source, usingTemplates templatesPaths: Paths, output: Output, forceParse: [String] = []) throws -> [FolderWatcher.Local]? {
+        return try scanFiles(source,
+                             usingTemplates: templatesPaths,
+                             output: output,
+                             forceParse: forceParse) { result in
+                                try self.generate(source: source, templatePaths: templatesPaths, output: output, parsingResult: result)
+
+        }
+    }
+
+    private func parse(source: Source, output: Output, forceParse: [String]) throws -> Parser.ParsingResult {
+        var result: Parser.ParsingResult!
+        switch source {
+        case let .sources(paths):
+            let parser = Parser(paths: paths,
+                                forceParse: forceParse,
+                                verboseLogging: self.verbose || self.watcherEnabled,
+                                cachesPath: { self.cachesDir(sourcePath: $0) })
+            result = try parser.parse()
+        case let .projects(projects):
+            var paths = [Path]()
+            var modules = [String]()
+            projects.forEach { project in
+                project.targets.forEach { target in
+                    guard let projectTarget = project.file.target(named: target.name) else { return }
+
+                    let files: [Path] = project.file.sourceFilesPaths(target: projectTarget, sourceRoot: project.root)
+                    files.forEach { file in
+                        guard !project.exclude.contains(file) else { return }
+                        paths.append(file)
+                        modules.append(target.module)
+                    }
+                }
+            }
+            let parser = Parser(paths: Paths(include: paths),
+                                modules: modules,
+                                verboseLogging: self.verbose || self.watcherEnabled)
+            result = try parser.parse()
+        }
+
+        return result
     }
 
     private func topPaths(from paths: [Path]) -> [Path] {
@@ -237,132 +255,11 @@ class Sourcery {
 
 }
 
-// MARK: - Parsing
-
-extension Sourcery {
-    typealias ParsingResult = (types: Types, inlineRanges: [(file: String, ranges: [String: NSRange])])
-
-    fileprivate func parse(from: [Path], exclude: [Path] = [], forceParse: [String] = [], modules: [String]?) throws -> ParsingResult {
-        if let modules = modules {
-            precondition(from.count == modules.count, "There should be module for each file to parse")
-        }
-
-        Log.info("Scanning sources...")
-
-        var inlineRanges = [(file: String, ranges: [String: NSRange])]()
-        var allResults = [FileParserResult]()
-
-        try from.enumerated().forEach { index, from in
-            let fileList = from.isDirectory ? try from.recursiveChildren() : [from]
-            let sources = try fileList
-                .filter { $0.isSwiftSourceFile }
-                .filter {
-                    let exclude = exclude
-                        .map { $0.isDirectory ? try? $0.recursiveChildren() : [$0] }
-                        .compactMap({ $0 }).flatMap({ $0 })
-                    return !exclude.contains($0)
-                }
-                .compactMap { (path: Path) -> (path: Path, contents: String)? in
-                    do {
-                        return (path: path, contents: try path.read(.utf8))
-                    } catch {
-                        Log.warning("Skipping file at \(path) as it does not exist")
-                        return nil
-                    }
-                }
-                .filter {
-                    let result = Verifier.canParse(content: $0.contents,
-                                                   path: $0.path,
-                                                   forceParse: forceParse)
-                    if result == .containsConflictMarkers {
-                        throw Error.containsMergeConflictMarkers
-                    }
-
-                    return result == .approved
-                }
-                .map {
-                    try FileParser(contents: $0.contents, path: $0.path, module: modules?[index])
-            }
-
-            var previousUpdate = 0
-            var accumulator = 0
-            let step = sources.count / 10 // every 10%
-
-            let results = try sources.parallelMap({ try self.loadOrParse(parser: $0, cachesPath: cachesDir(sourcePath: from)) }, progress: !(verbose || watcherEnabled) ? nil : { _ in
-                if accumulator > previousUpdate + step {
-                    previousUpdate = accumulator
-                    let percentage = accumulator * 100 / sources.count
-                    Log.info("Scanning sources... \(percentage)% (\(sources.count) files)")
-                }
-                accumulator += 1
-                })
-
-            allResults.append(contentsOf: results)
-        }
-
-        let parserResult = allResults.reduce(FileParserResult(path: nil, module: nil, types: [], typealiases: [])) { acc, next in
-            acc.typealiases += next.typealiases
-            acc.types += next.types
-
-            // swiftlint:disable:next force_unwrapping
-            inlineRanges.append((next.path!, next.inlineRanges))
-            return acc
-        }
-
-        //! All files have been scanned, time to join extensions with base class
-        let types = Composer().uniqueTypes(parserResult)
-
-        Log.info("Found \(types.count) types.")
-        return (Types(types: types), inlineRanges)
-    }
-
-    private func loadOrParse(parser: FileParser, cachesPath: @autoclosure () -> Path?) throws -> FileParserResult {
-        guard let pathString = parser.path else { fatalError("Unable to retrieve \(String(describing: parser.path))") }
-
-        guard let cachesPath = cachesPath() else {
-            return try parser.parse()
-        }
-
-        let path = Path(pathString)
-        let artifacts = cachesPath + "\(pathString.hash).srf"
-
-        guard artifacts.exists,
-              let contentSha = parser.initialContents.sha256(),
-              let unarchived = load(artifacts: artifacts.string, contentSha: contentSha) else {
-
-            let result = try parser.parse()
-
-            let data = NSKeyedArchiver.archivedData(withRootObject: result)
-            do {
-                try artifacts.write(data)
-            } catch {
-                fatalError("Unable to save artifacts for \(path) under \(artifacts), error: \(error)")
-            }
-
-            return result
-        }
-
-        return unarchived
-    }
-
-    private func load(artifacts: String, contentSha: String) -> FileParserResult? {
-        var unarchivedResult: FileParserResult?
-        SwiftTryCatch.try({
-                              if let unarchived = NSKeyedUnarchiver.unarchiveObject(withFile: artifacts) as? FileParserResult, unarchived.sourceryVersion == Sourcery.version, unarchived.contentSha == contentSha {
-                                  unarchivedResult = unarchived
-                              }
-                          }, catch: { _ in
-            Log.warning("Failed to unarchive \(artifacts) due to error, re-parsing")
-        }, finallyBlock: {})
-
-        return unarchivedResult
-    }
-}
-
 // MARK: - Generation
+
 extension Sourcery {
 
-    fileprivate func generate(source: Source, templatePaths: Paths, output: Output, parsingResult: ParsingResult) throws {
+    fileprivate func generate(source: Source, templatePaths: Paths, output: Output, parsingResult: Parser.ParsingResult) throws {
         Log.info("Loading templates...")
         let allTemplates = try templates(from: templatePaths)
         Log.info("Loaded \(allTemplates.count) templates.")
@@ -447,7 +344,7 @@ extension Sourcery {
         }
     }
 
-    private func generate(_ template: Template, forParsingResult parsingResult: ParsingResult, outputPath: Path) throws -> String {
+    private func generate(_ template: Template, forParsingResult parsingResult: Parser.ParsingResult, outputPath: Path) throws -> String {
         guard watcherEnabled else {
             let result = try Generator.generate(parsingResult.types, template: template, arguments: self.arguments)
             return try processRanges(in: parsingResult, result: result, outputPath: outputPath)
@@ -463,14 +360,14 @@ extension Sourcery {
         return try processRanges(in: parsingResult, result: result, outputPath: outputPath)
     }
 
-    private func processRanges(in parsingResult: ParsingResult, result: String, outputPath: Path) throws -> String {
+    private func processRanges(in parsingResult: Parser.ParsingResult, result: String, outputPath: Path) throws -> String {
         var result = result
         result = processFileRanges(for: parsingResult, in: result, outputPath: outputPath)
         result = try processInlineRanges(for: parsingResult, in: result)
         return TemplateAnnotationsParser.removingEmptyAnnotations(from: result)
     }
 
-    private func processInlineRanges(`for` parsingResult: ParsingResult, in contents: String) throws -> String {
+    private func processInlineRanges(`for` parsingResult: Parser.ParsingResult, in contents: String) throws -> String {
         var (annotatedRanges, rangesToReplace) = TemplateAnnotationsParser.annotationRanges("inline", contents: contents)
 
         typealias MappedInlineAnnotations = (
@@ -523,7 +420,7 @@ extension Sourcery {
         return bridged as String
     }
 
-    private func processFileRanges(`for` parsingResult: ParsingResult, in contents: String, outputPath: Path) -> String {
+    private func processFileRanges(`for` parsingResult: Parser.ParsingResult, in contents: String, outputPath: Path) -> String {
         let files = TemplateAnnotationsParser.parseAnnotations("file", contents: contents, aggregate: true)
 
         files
